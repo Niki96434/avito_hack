@@ -1,0 +1,758 @@
+openapi: 3.0.3
+
+info:
+  title: Anti-Scam Trainer API
+  version: 0.1.0
+  description: |
+    Публичный API интерактивного антискам-тренажёра.
+
+    Реализованная часть: проверка живости, каталог учебных сценариев, запуск
+    попытки, восстановление её состояния и отправка выбора.
+
+    Скрытие будущего хода сценария — часть контракта:
+
+    - каталог отдаёт только метаданные, без узлов и вариантов выбора;
+    - попытка показывает лишь уже раскрытые узлы;
+    - у варианта выбора публикуются только идентификатор и подпись;
+    - следующий узел, изменение результата, критичность, метки риска и
+      эффекты навыков не публикуются никогда;
+    - объяснение последствия появляется только после того, как выбор сделан.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+# Пустой список означает, что аутентификация не требуется намеренно:
+# в MVP тренажёр не хранит персональные данные и не имеет учётных записей.
+security: []
+
+servers:
+  - url: http://localhost:8080
+    description: Локальный запуск
+
+tags:
+  - name: health
+    description: Проверка работоспособности сервиса
+  - name: scenarios
+    description: Каталог учебных сценариев
+  - name: attempts
+    description: Прохождение сценария
+
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      summary: Проверка живости
+      description: |
+        Подтверждает, что процесс запущен и отвечает.
+        Внешние системы намеренно не проверяются.
+      operationId: getHealth
+      responses:
+        "200":
+          description: Сервис работает
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: ok
+
+  /api/v1/scenarios:
+    get:
+      tags: [scenarios]
+      summary: Список доступных сценариев
+      description: |
+        Возвращает активные сценарии, отсортированные по идентификатору.
+        Порядок стабилен: одинаковый запрос даёт одинаковый ответ.
+      operationId: listScenarios
+      parameters:
+        - name: role
+          in: query
+          required: false
+          description: Фильтр по роли. Без параметра возвращаются сценарии всех ролей.
+          schema:
+            $ref: "#/components/schemas/ScenarioRole"
+      responses:
+        "200":
+          description: Каталог сценариев
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScenarioListResponse"
+              example:
+                scenarios:
+                  - id: buyer-fake-delivery
+                    version: 1
+                    slug: buyer-fake-delivery
+                    role: buyer
+                    title: Ссылка на доставку
+                    description: "Покупка товара с доставкой: продавец предлагает оплату по ссылке."
+                    difficulty: medium
+                    estimatedMinutes: 4
+        "400":
+          description: Указана неподдерживаемая роль
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: UNSUPPORTED_ROLE
+                  message: Указана неподдерживаемая роль.
+                  requestId: 7b2c1a9e4f
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/scenarios/{scenarioId}:
+    get:
+      tags: [scenarios]
+      summary: Описание одного сценария
+      description: |
+        Возвращает метаданные сценария.
+
+        Отключённый сценарий отвечает так же, как несуществующий: клиенту не
+        сообщается о наличии скрытого содержимого.
+      operationId: getScenario
+      parameters:
+        - name: scenarioId
+          in: path
+          required: true
+          description: Идентификатор сценария
+          schema:
+            type: string
+          example: buyer-fake-delivery
+      responses:
+        "200":
+          description: Метаданные сценария
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Scenario"
+              example:
+                id: seller-payment-already-sent
+                version: 1
+                slug: seller-payment-already-sent
+                role: seller
+                title: Оплата уже отправлена
+                description: "Продажа товара: покупатель уверяет, что деньги уже перевёл."
+                difficulty: hard
+                estimatedMinutes: 5
+        "404":
+          description: Сценарий не найден
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: SCENARIO_NOT_FOUND
+                  message: Сценарий не найден.
+                  requestId: 7b2c1a9e4f
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/attempts:
+    post:
+      tags: [attempts]
+      summary: Начать прохождение сценария
+      description: |
+        Создаёт попытку и раскрывает начало сценария.
+
+        Раскрытие идёт от стартового узла и останавливается на первом узле
+        решения или на финале. Подряд идущие сообщения возвращаются одной
+        пачкой, поэтому фронтенду не нужен запрос на каждую реплику диалога.
+
+        Версия сценария фиксируется за попыткой: последующая правка содержимого
+        не изменит уже идущее прохождение.
+      operationId: startAttempt
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartAttemptRequest"
+            example:
+              scenarioId: buyer-fake-delivery
+      responses:
+        "201":
+          description: Попытка создана
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Attempt"
+        "400":
+          description: Тело запроса некорректно или не содержит scenarioId
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: INVALID_REQUEST
+                  message: Поле scenarioId обязательно.
+                  requestId: 7b2c1a9e4f
+        "404":
+          description: Сценарий не найден или недоступен
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: SCENARIO_NOT_FOUND
+                  message: Сценарий не найден.
+                  requestId: 7b2c1a9e4f
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/attempts/{attemptId}:
+    get:
+      tags: [attempts]
+      summary: Текущее состояние попытки
+      description: |
+        Возвращает попытку целиком: раскрытые узлы в порядке появления, уже
+        сделанные выборы с показанными объяснениями и текущий узел.
+
+        Этого достаточно, чтобы полностью восстановить экран после перезагрузки
+        страницы — отдельного endpoint для продолжения не требуется.
+
+        Аутентификации нет, поэтому идентификатор попытки одновременно служит
+        секретом доступа к ней.
+      operationId: getAttempt
+      parameters:
+        - name: attemptId
+          in: path
+          required: true
+          description: Идентификатор попытки, полученный при её создании
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Состояние попытки
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Attempt"
+        "404":
+          description: Попытка не найдена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: ATTEMPT_NOT_FOUND
+                  message: Попытка не найдена.
+                  requestId: 7b2c1a9e4f
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/attempts/{attemptId}/choices:
+    post:
+      tags: [attempts]
+      summary: Отправить выбор
+      description: |
+        Применяет выбор пользователя и продвигает прохождение до следующего
+        решения или до финала.
+
+        Сервер проверяет запрос по своим данным: попытка не завершена, узел
+        совпадает с текущим, узел действительно является точкой решения,
+        а вариант принадлежит этому узлу зафиксированной версии сценария.
+
+        Влияние выбора на результат и навыки берётся только из сценария —
+        клиент не может прислать ни очки, ни эффекты.
+
+        ### Повторная отправка
+
+        `idempotencyKey` защищает от двойного применения при обрыве связи:
+
+        - тот же ключ с теми же `nodeId` и `choiceId` возвращает **тот же**
+          ответ, эффекты повторно не применяются;
+        - тот же ключ с другими данными — `409 IDEMPOTENCY_KEY_CONFLICT`;
+        - ключ действует в пределах одной попытки.
+
+        Клиент должен генерировать ключ сам и повторять запрос с тем же
+        значением, а не с новым.
+      operationId: submitChoice
+      parameters:
+        - name: attemptId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitChoiceRequest"
+            example:
+              nodeId: channel-decision
+              choiceId: stay-on-platform
+              idempotencyKey: 0f8c2a1b-7d4e-4a19-9c3f-2b6e5d1a8c47
+      responses:
+        "200":
+          description: Выбор применён
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Transition"
+        "400":
+          description: Тело запроса некорректно или не заполнены обязательные поля
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: INVALID_REQUEST
+                  message: Поле idempotencyKey обязательно.
+                  requestId: 7b2c1a9e4f
+        "404":
+          description: Попытка не найдена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: ATTEMPT_NOT_FOUND
+                  message: Попытка не найдена.
+                  requestId: 7b2c1a9e4f
+        "409":
+          description: |
+            Состояние попытки не позволяет применить выбор:
+
+            - `ATTEMPT_ALREADY_COMPLETED` — прохождение завершено;
+            - `STALE_NODE` — прислан не тот узел, на котором стоит попытка;
+            - `IDEMPOTENCY_KEY_CONFLICT` — ключ повтора уже использован с другими данными;
+            - `CONCURRENT_TRANSITION` — попытку изменил другой запрос.
+
+            В каждом случае нужно перечитать состояние попытки.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: STALE_NODE
+                  message: Присланный узел не совпадает с текущим. Перечитайте состояние попытки.
+                  requestId: 7b2c1a9e4f
+        "422":
+          description: |
+            Выбор не применим к текущему узлу:
+
+            - `NODE_NOT_DECISION` — на текущем узле выбор не принимается;
+            - `CHOICE_NOT_FOUND` — вариант не принадлежит текущему узлу.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: CHOICE_NOT_FOUND
+                  message: Такой вариант выбора недоступен на текущем узле.
+                  requestId: 7b2c1a9e4f
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  responses:
+    PayloadTooLarge:
+      description: Тело запроса превышает допустимый размер
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: PAYLOAD_TOO_LARGE
+              message: Тело запроса превышает допустимый размер.
+              requestId: 7b2c1a9e4f
+
+    InternalError:
+      description: Внутренняя ошибка сервера
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: INTERNAL_ERROR
+              message: Внутренняя ошибка сервера.
+              requestId: 7b2c1a9e4f
+
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+
+    ScenarioRole:
+      type: string
+      description: Роль, в которой пользователь проходит сценарий.
+      enum: [buyer, seller]
+
+    ScenarioDifficulty:
+      type: string
+      description: Субъективная сложность сценария.
+      enum: [easy, medium, hard]
+
+    Scenario:
+      type: object
+      description: |
+        Метаданные сценария. Содержимое графа сюда не входит по соображениям
+        безопасности: иначе клиент увидел бы правильные ответы заранее.
+      required:
+        [id, version, slug, role, title, description, difficulty, estimatedMinutes]
+      properties:
+        id:
+          type: string
+          description: Устойчивый идентификатор сценария.
+          example: buyer-fake-delivery
+        version:
+          type: integer
+          format: int32
+          minimum: 1
+          description: |
+            Версия содержимого. Начатая попытка закрепляется за версией,
+            поэтому правка сценария не меняет уже идущее прохождение.
+          example: 1
+        slug:
+          type: string
+          description: Человекочитаемый идентификатор для ссылок.
+          example: buyer-fake-delivery
+        role:
+          $ref: "#/components/schemas/ScenarioRole"
+        title:
+          type: string
+          example: Ссылка на доставку
+        description:
+          type: string
+          example: "Покупка товара с доставкой: продавец предлагает оплату по ссылке."
+        difficulty:
+          $ref: "#/components/schemas/ScenarioDifficulty"
+        estimatedMinutes:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Ожидаемая длительность прохождения в минутах.
+          example: 4
+
+    ScenarioListResponse:
+      type: object
+      required: [scenarios]
+      properties:
+        scenarios:
+          type: array
+          items:
+            $ref: "#/components/schemas/Scenario"
+
+    StartAttemptRequest:
+      type: object
+      required: [scenarioId]
+      properties:
+        scenarioId:
+          type: string
+          description: Идентификатор сценария из каталога.
+          example: buyer-fake-delivery
+
+    AttemptStatus:
+      type: string
+      description: |
+        Состояние прохождения. Попытка становится `completed` только после
+        того, как сервер довёл её до финального узла.
+      enum: [in_progress, completed]
+
+    NodeType:
+      type: string
+      description: |
+        Тип раскрытого узла: реплика диалога, точка принятия решения или финал.
+      enum: [message, decision, terminal]
+
+    OutcomeType:
+      type: string
+      description: Характер финала сценария.
+      enum: [safe, unsafe]
+
+    Severity:
+      type: string
+      description: Насколько опасным оказался сделанный выбор.
+      enum: [safe, warning, dangerous]
+
+    AttemptChoice:
+      type: object
+      description: |
+        Доступное действие. Публикуются только идентификатор и подпись:
+        следующий узел и влияние выбора остаются на сервере.
+      required: [id, label]
+      properties:
+        id:
+          type: string
+          example: stay-on-platform
+        label:
+          type: string
+          example: Остаться в чате площадки
+
+    AttemptOutcome:
+      type: object
+      description: Итог сценария. Появляется только у финального узла.
+      required: [type, title, explanation]
+      properties:
+        type:
+          $ref: "#/components/schemas/OutcomeType"
+        title:
+          type: string
+        explanation:
+          type: string
+
+    AttemptNode:
+      type: object
+      description: |
+        Раскрытый узел сценария. Набор заполненных полей зависит от типа:
+        `message` содержит отправителя и текст, `decision` — вопрос и варианты,
+        `terminal` — итог.
+      required: [id, type]
+      properties:
+        id:
+          type: string
+          example: channel-decision
+        type:
+          $ref: "#/components/schemas/NodeType"
+        sender:
+          type: string
+          description: Кто прислал сообщение. Только для узлов типа `message`.
+          example: seller
+        text:
+          type: string
+          description: Текст реплики. Только для узлов типа `message`.
+        prompt:
+          type: string
+          description: Вопрос пользователю. Только для узлов типа `decision`.
+        choices:
+          type: array
+          description: Доступные действия. Только для узлов типа `decision`.
+          items:
+            $ref: "#/components/schemas/AttemptChoice"
+        outcome:
+          $ref: "#/components/schemas/AttemptOutcome"
+
+    AttemptConsequence:
+      type: object
+      description: |
+        Учебное объяснение последствий выбора. Появляется только после того,
+        как выбор сделан.
+      required: [severity, title, explanation]
+      properties:
+        severity:
+          $ref: "#/components/schemas/Severity"
+        title:
+          type: string
+        explanation:
+          type: string
+        realWorldRule:
+          type: string
+          description: Короткое правило, применимое в реальной сделке.
+
+    AttemptDecision:
+      type: object
+      description: Ранее сделанный выбор вместе с показанным объяснением.
+      required: [nodeId, choiceId, label, consequence]
+      properties:
+        nodeId:
+          type: string
+        choiceId:
+          type: string
+        label:
+          type: string
+        consequence:
+          $ref: "#/components/schemas/AttemptConsequence"
+
+    AttemptScenarioRef:
+      type: object
+      description: Сценарий попытки в зафиксированной версии.
+      required: [id, version, slug, role, title]
+      properties:
+        id:
+          type: string
+        version:
+          type: integer
+          format: int32
+          minimum: 1
+        slug:
+          type: string
+        role:
+          $ref: "#/components/schemas/ScenarioRole"
+        title:
+          type: string
+
+    Attempt:
+      type: object
+      description: |
+        Публичное состояние попытки. Содержит только раскрытую часть сценария —
+        по нему нельзя узнать, куда ведут доступные варианты.
+      required:
+        [attemptId, scenario, status, score, currentNodeId, revealedNodes, decisions, startedAt, updatedAt]
+      properties:
+        attemptId:
+          type: string
+          description: |
+            Идентификатор попытки. Аутентификации нет, поэтому он же служит
+            секретом доступа — не публикуйте его.
+        scenario:
+          $ref: "#/components/schemas/AttemptScenarioRef"
+        status:
+          $ref: "#/components/schemas/AttemptStatus"
+        score:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 100
+          description: |
+            Результат прохождения. Начинается со 100 и уменьшается за опасные
+            решения. Считается только на сервере по данным сценария.
+          example: 100
+        outcome:
+          $ref: "#/components/schemas/OutcomeType"
+        currentNodeId:
+          type: string
+          description: |
+            Узел, на котором остановлено прохождение. Именно его сервер ждёт
+            в запросе следующего выбора.
+        revealedNodes:
+          type: array
+          description: Раскрытые узлы в порядке появления.
+          items:
+            $ref: "#/components/schemas/AttemptNode"
+        decisions:
+          type: array
+          description: Уже сделанные выборы в порядке принятия.
+          items:
+            $ref: "#/components/schemas/AttemptDecision"
+        startedAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+          description: Проставляется один раз, при достижении финала.
+
+    SubmitChoiceRequest:
+      type: object
+      description: |
+        Запрос содержит только то, что сервер не может вычислить сам.
+        Следующего узла, изменения результата и эффектов здесь нет намеренно.
+      required: [nodeId, choiceId, idempotencyKey]
+      properties:
+        nodeId:
+          type: string
+          description: |
+            Узел, который видел пользователь. Служит для сверки с текущим узлом
+            попытки: расхождение даёт `409 STALE_NODE`.
+          example: channel-decision
+        choiceId:
+          type: string
+          description: Выбранный вариант из числа показанных на этом узле.
+          example: stay-on-platform
+        idempotencyKey:
+          type: string
+          description: |
+            Уникальное значение, которое генерирует клиент. При повторе того же
+            запроса используйте тот же ключ, чтобы эффекты не применились дважды.
+          example: 0f8c2a1b-7d4e-4a19-9c3f-2b6e5d1a8c47
+
+    AcceptedChoice:
+      type: object
+      description: Выбор, который сервер принял и применил.
+      required: [nodeId, choiceId, label]
+      properties:
+        nodeId:
+          type: string
+        choiceId:
+          type: string
+        label:
+          type: string
+
+    Transition:
+      type: object
+      description: |
+        Результат одного шага прохождения: что было принято, чему это учит и
+        что показать дальше. Содержит только новые узлы — уже показанные
+        клиент получил раньше.
+      required:
+        [attemptId, status, score, acceptedChoice, consequence, revealedNodes, currentNodeId]
+      properties:
+        attemptId:
+          type: string
+        status:
+          $ref: "#/components/schemas/AttemptStatus"
+        score:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 100
+          description: Результат попытки после применения выбора.
+        outcome:
+          $ref: "#/components/schemas/OutcomeType"
+        acceptedChoice:
+          $ref: "#/components/schemas/AcceptedChoice"
+        consequence:
+          $ref: "#/components/schemas/AttemptConsequence"
+        revealedNodes:
+          type: array
+          description: Узлы, раскрытые этим шагом, в порядке появления.
+          items:
+            $ref: "#/components/schemas/AttemptNode"
+        currentNodeId:
+          type: string
+          description: Узел, на котором прохождение остановилось.
+        completedAt:
+          type: string
+          format: date-time
+          description: Заполняется, когда шаг довёл попытку до финала.
+
+    ErrorResponse:
+      type: object
+      description: Единый формат ошибки для всех endpoint.
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: |
+                Стабильный код ошибки. Клиент опирается на код, а не на текст
+                сообщения: текст может меняться.
+              enum:
+                - NOT_FOUND
+                - INVALID_REQUEST
+                - PAYLOAD_TOO_LARGE
+                - SCENARIO_NOT_FOUND
+                - UNSUPPORTED_ROLE
+                - ATTEMPT_NOT_FOUND
+                - ATTEMPT_ALREADY_COMPLETED
+                - STALE_NODE
+                - IDEMPOTENCY_KEY_CONFLICT
+                - CONCURRENT_TRANSITION
+                - NODE_NOT_DECISION
+                - CHOICE_NOT_FOUND
+                - INTERNAL_ERROR
+            message:
+              type: string
+              description: Понятное человеку описание без внутренних подробностей.
+            requestId:
+              type: string
+              description: |
+                Идентификатор запроса, совпадает с заголовком `X-Request-ID`.
+                Используется для поиска записи в логах.
